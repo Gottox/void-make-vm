@@ -1,37 +1,71 @@
-#!/bin/sh
-tmp=$(mktemp -d)
+#!/bin/sh -e
+SERVICES='agetty-console dhcpcd'
+TARGET=$1
 
-cd "$tmp" || exit 1
+if [ -z "$TARGET" ]; then
+	TARGET=$(mktemp -d)
+fi
+
+[ -d "$TARGET" ] || mkdir "$TARGET"
+
+cd "$TARGET"
+
+get_repositories() {
+	prefix=$1
+	format=$2
+	printf -- "$format" $(
+		xbps-query -L | sed "s/ *[0-9]* //; s/ .*//; /^\//s#^#$prefix#"
+	)
+}
+
+# PREPARE ENV
+mkdir root cache
+
+# PREPARE IMAGE
+
 dd if=/dev/zero of=image seek=10G bs=1 count=0
 mkfs.ext4 image
-mkdir root
-mount -o loop image root 
-mkdir -p root/etc/xbps.d
-cp /etc/xbps.d/* root/etc/xbps.d
-mkdir -p root/var/cache/xbps
-mount --bind -o ro /var/cache/xbps root/var/cache/xbps
-xbps-install --repository='https://alpha.de.repo.voidlinux.org/current' --yes -U -S -r "$PWD/root" base-system ncurses-base
-umount root/var/cache/xbps
-chroot root xbps-reconfigure -a
-for i in agetty-console dhcpcd; do
-	ln -s "/etc/sv/$i" root/etc/runit/runsvdir/default/$i
-done
-echo "/bin/bash" | chroot root chsh root
-for i in root/etc/sv/agetty-*; do
-	echo "GETTY_ARGS='-a root'" > "$i/conf"
-done
 
-echo TERM=linux > root/etc/profile.d/term.sh
-mkdir root/host
-echo void /host 9p defaults 0 0 >> root/etc/fstab
+ln -s /var/cache/xbps/* cache
 
-cp "$(ls root/boot/vmlinuz-* | sort -V | tail -n 1)" vmlinuz
-cp "$(ls root/boot/initramfs-* | sort -V | tail -n 1)" initrd
-umount root
+# MOUNT & XBPS-INSTALL & CONFIGURE
+sudo unshare -m /bin/sh -e -c "
+	mount -o loop image root
+
+	yes | xbps-install \
+		$(get_repositories "/host" "--repository=%s ") \
+		--yes -S \
+		--cachedir \"$PWD/cache\" \
+		-r \"$PWD/root\" \
+		base-system ncurses-base
+
+	echo void /host 9p defaults 0 0 >> root/etc/fstab
+	echo '. /host$PWD/rc.local' > root/etc/rc.local
+
+	cp \"\$(ls root/boot/vmlinuz-* | sort -V | tail -n 1)\" vmlinuz
+	cp \"\$(ls root/boot/initramfs-* | sort -V | tail -n 1)\" initrd
+	chown $USER vmlinuz initrd
+	mkdir root/host
+"
+
+cat > rc.local <<EOF
+	echo /bin/bash | chsh root
+	for i in /etc/sv/agetty-*; do
+		echo "GETTY_ARGS='-a root'" > "\$i/conf"
+	done
+
+	for i in $SERVICES; do
+		ln -sf "/etc/sv/\$i" "/etc/runit/runsvdir/default/\$i"
+	done
+	echo "$(get_repositories "/host" "repository=%s\n")" > /etc/xbps.d/host.conf
+
+	echo TERM=linux > /etc/profile.d/term.sh
+EOF
 
 cat > run <<EOF
-tmp="\$(dirname \$0)"
-cd "\$tmp"
+#!/bin/sh
+TARGET="\$(realpath \$(dirname \$0))"
+cd "\$TARGET"
 qemu-system-x86_64 \
 	-kernel vmlinuz \
 	-initrd initrd \
@@ -44,11 +78,12 @@ qemu-system-x86_64 \
 	-net nic \
 	-virtfs local,id=void,path=/,security_model=mapped,readonly,mount_tag=void
 
-echo "To start again execute \$tmp/run"
+echo ==========================================================
+echo "To start again execute \$TARGET/run"
 echo "Enter to delete the virtual machine, Ctrl-C to keep"
 head -n 1
 cd / || exit 1
-rm -r "\$tmp"
+rm -r "\$TARGET"
 EOF
 chmod +x run
-exec ./run
+exec $PWD/run
